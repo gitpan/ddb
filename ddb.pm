@@ -24,7 +24,7 @@ BEGIN {
 # untie %db;
 
 # globals
-$version	= 1.2;
+$VERSION	= 1.3;
 $hash_size	= 16381; # default, or pass to tie after filename
 $sentinel	= 1;
 $empty_buf_size	= 256;
@@ -99,18 +99,17 @@ sub STORE {
 
     if ($old_val_len < $val_len) {
       my $rec = $db->pack_rec($key, $val, $next_pos);
-      my $new_pos = $db->append_rec($rec);
+      $db->append_rec($rec);
       my $old_rec_len = $db->rec_len($key_len, $old_val_len);
       $db->erase($pos, $old_rec_len);
     } else {
       $db->replace_val($key, $val, $pos, $next_pos, $old_val_len);
     }
   } else {
-    my $rec = $db->pack_rec($key, $val, $next_pos);
+    my $rec = $db->pack_rec($key, $val, 0);
     $db->append_rec($rec);
   }
 
-  $db->sync;
   $db->lock_un;
   $val
 }
@@ -129,12 +128,13 @@ sub DELETE {
 
   $db->seek($ptr_pos, SEEK_SET);
   $db->write_int($next_pos);
+  $db->sync;
 
   my $rec_len = $db->rec_len($key_len, $val_len);
   $db->erase($pos, $rec_len);
+  $db->sync;
 
 DONE:
-  $db->sync;
   $db->lock_un;
   $val
 }
@@ -149,7 +149,6 @@ sub CLEAR {
   $db->write_zero(4 * $db->{hash_size});
 
   my $pos = $db->tell;
-  $pos == $db->data_section or die;
   $db->truncate($pos);
 
   $db->sync;
@@ -397,7 +396,7 @@ sub read_key {
   my $key_len = $db->read_int;
 
   if (@_ > 1) {
-    $key_len < 0 || $pos + $key_len > $end_pos and
+    $key_len < 0 || $pos + 9 + $key_len > $end_pos and
       $db->die("key_len $key_len out of bounds");
   }
 
@@ -455,7 +454,7 @@ sub write_byte {
 
 sub write_sentinel {
   my $db = shift;
-  $db->write_byte(1)
+  $db->write_byte($sentinel)
 }
 
 sub write_int {
@@ -523,8 +522,11 @@ sub write_rec {
   }
 
   $db->write($rec);
+  $db->sync;
+
   $db->seek($ptr_pos, SEEK_SET);
   $db->write_int($pos);
+  $db->sync;
 }
 
 sub append_rec {
@@ -580,6 +582,7 @@ sub replace_val {
 
   $db->seek($ptr_pos, SEEK_SET);
   $db->write_int($pos);
+  $db->sync;
 
   $db->truncate($new_pos);
 
@@ -866,6 +869,7 @@ sub defrag {
 
           $db->seek($ptr_pos, SEEK_SET);
           $db->write_int($pos);
+          $db->sync;
         }
       } else {
         $db->warn("val_hash mismatch at $pos+$rec_len");
@@ -885,6 +889,7 @@ sub defrag {
       my $rec = $db->pack_rec($key, $val, $next_pos, $val_hash);
       $db->move_rec($rec, $pos, $empty_pos);
     } else {
+      # should never happen
       $empty_len = 0;
     }
 
@@ -925,18 +930,17 @@ sub repair {
       next;
     }
 
-    $db->seek($ptr_pos, SEEK_SET);
-    my $pos = $db->read_int;
+#    $db->seek($ptr_pos, SEEK_SET);
+#    my $pos = $db->read_int;
+#    $db->seek($pos, SEEK_SET);
+#    $db->lock_sh;
+#    my ($key, $next_pos) = eval { $db->read_key };
+#    $@ or $db->lock_un;
+#    $next_pos ||= 0;
+#    $next_pos == $ptr_pos - 1 and $next_pos = 0; # loops
 
-    $db->seek($pos, SEEK_SET);
-
-    $db->lock_sh;
-    my ($key, $next_pos) = eval { $db->read_key };
-    $@ or $db->lock_un;
-    $next_pos ||= 0;
-    $next_pos == $ptr_pos - 1 and $next_pos = 0;
-
-    $db->warn("unlinking from $ptr_pos, to $next_pos");
+    my $next_pos = 0;
+    $db->warn("unlinking from $ptr_pos, to $next_pos (run defrag)");
     $db->seek($ptr_pos, SEEK_SET);
     $db->write_int($next_pos);
   }
