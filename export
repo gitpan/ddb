@@ -1,0 +1,41 @@
+#!/usr/bin/perl
+
+use ddb;
+use Fcntl qw(:seek);
+
+# defaults
+$show_step	= 100;
+$col_delim	= "\t";
+$row_delim	= "\n";
+
+if (@ARGV < 1) {
+  print STDERR "Usage: $0 file.ddb\n";
+  exit 1;
+}
+
+my $db_filename = shift(@ARGV);
+my $db = tie %db, ddb, $db_filename or die "$0: $db_filename: $!\n";
+
+my $count = 0;
+
+select(STDOUT);
+$| = 1;
+
+eval {
+  while (1) {
+    my ($k, $v) = each %db;
+    last unless defined $k;
+
+    $count % $show_step or print STDERR "$0: $count records\r";
+    ++$count;
+    print join('', $k, $col_delim, $v, $row_delim);
+  }
+};
+
+print STDERR "$0: $count records\r";
+print STDERR "\n";
+
+$@ and die $@;
+
+untie %db;
+exit 0;

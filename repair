@@ -1,0 +1,23 @@
+#!/usr/bin/perl
+
+use ddb;
+
+if (@ARGV < 1) {
+  print STDERR "Usage: $0 file.ddb\n";
+  exit 1;
+}
+
+my $db_filename = shift(@ARGV);
+my $db = tie %db, ddb, $db_filename or die "$0: $db_filename: $!\n";
+
+sub status {
+  my ($db, $sofar) = @_;
+  print STDERR "$0: $sofar records\r";
+}
+
+$db->repair(\&status);
+
+untie %db;
+
+print STDERR "\n";
+exit 0;

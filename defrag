@@ -1,0 +1,31 @@
+#!/usr/bin/perl
+
+use ddb;
+
+if (@ARGV < 1) {
+  print STDERR "Usage: $0 file.ddb\n";
+  exit 1;
+}
+
+my $db_filename = shift(@ARGV);
+my $db = tie %db, ddb, $db_filename or die "$0: $db_filename: $!\n";
+
+sub status {
+  my ($db, $sofar, $total, $records) = @_;
+  if (defined($records)) {
+    $records % 100 and return;
+    print STDERR "$0: $sofar / $total bytes, $records records searched\r";
+  } else {
+    print STDERR "$0: $sofar / $total bytes\r";
+  }
+}
+
+eval {
+  $db->defrag(\&status);
+};
+
+print STDERR "\n";
+$@ and die $@;
+
+untie %db;
+exit 0;
