@@ -24,7 +24,7 @@ BEGIN {
 # untie %db;
 
 # globals
-$VERSION	= 1.3;
+$VERSION	= '1.3.1';
 $hash_size	= 16381; # default, or pass to tie after filename
 $sentinel	= 1;
 $empty_buf_size	= 256;
@@ -963,11 +963,12 @@ sub test {
   local $SIG{PIPE} = sub { };
   local $debug = 1;
   my $procs = 0;
-  
+
+  ok 0, 65;
+
   # clear
   $db->{hash_size} = 19;
   %db = ( );
-  ok 0, keys(%db) == 0;
 
   # store, fetch, delete, exists
   $db{hello} = 'world';

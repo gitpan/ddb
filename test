@@ -1,5 +1,6 @@
 #!/usr/bin/perl
 
+use lib '.';
 use ddb;
 
 my ($db_filename, $preserve);
@@ -25,6 +26,10 @@ $| = 1;
 
 sub ok {
   my ($db, $num, $ok) = @_;
+  if ($num == 0) {
+    print STDOUT "1..$ok\n";
+    return;
+  }
   $ok or print "not ";
   print STDOUT "ok $num\n";
   $ok or $db->die("not ok $num");
