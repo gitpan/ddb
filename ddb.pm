@@ -2,6 +2,7 @@
 # stupid berkeleydb always corrupts my files
 
 package ddb;
+use POSIX qw(:sys_wait_h);
 use Fcntl qw(:seek :flock O_RDONLY O_RDWR O_TRUNC O_CREAT);
 use Digest::MD5;
 
@@ -17,16 +18,14 @@ use Digest::MD5;
 # $db->defrag;
 # untie %db;
 
-# defaults
-$hash_size	= 16381; # or pass to tie after filename
+# globals
+$version	= 1.1;
+$hash_size	= 16381; # default, or pass to tie after filename
 $sentinel	= 1;
 $empty_buf_size	= 256;
-$magic		= 0xDDB10000; # use for version and hash type later
+$magic		= 0xDDB10000;
 $debug		= 0;
 $max_procs	= 10; # for test
-$version	= 1;
-
-# error-reporting variable, trust only within a lock
 $ptr_pos	= undef;
 
 # file format
@@ -40,7 +39,7 @@ $ptr_pos	= undef;
 # [key_len int32] [key, key_len * byte]
 # [padding, 0-3 bytes] [val_hash int32]
 # [val_len int32] [val, val_len * byte]
-
+#
 # in between each record can be zero or more null-bytes of free space.
 # the hash table values are absolute file offsets pointing to the
 # first byte of a record.  all int32s are big-endian and aligned.
@@ -79,50 +78,26 @@ sub STORE {
   $db->lock_ex;
   my ($pos, $next_pos) = $db->find($key);
 
-  unless (defined($pos)) {
-    $db->seek($ptr_pos, SEEK_SET);
-    my $head_pos = $db->read_int;
+  if (defined($pos)) {
+    my $key_len = length($key);
+    my $val_len = length($val);
+    $db->align_val($key_len);
+    $db->seek(4, SEEK_CUR);
+    my $old_val_len = $db->read_int;
 
-    my $rec = $db->make_rec($key, $val, $head_pos);
-    my $new_pos = $db->append_rec($rec);
-    $db->seek($ptr_pos, SEEK_SET);
-    $db->write_int($new_pos);
-    goto DONE;
-  }
-
-  $db->align_val(length($key));
-  my $old_val_pos = $db->tell;
-
-  $db->seek($old_val_pos + 4, SEEK_SET);
-  my $old_val_len = $db->read_int;
-  my $val_len = length($val);
-
-  # stick it on the end for now
-  my $rec = $db->make_rec($key, $val, $next_pos);
-  my $new_pos = $db->append_rec($rec);
-  $db->seek($ptr_pos, SEEK_SET);
-  $db->write_int($new_pos);
-
-  if ($val_len > $old_val_len) {
-    my $old_rec_len = $db->rec_len(length($key), $old_val_len);
-    $db->erase($pos, $old_rec_len);
+    if ($old_val_len < $val_len) {
+      my $rec = $db->pack_rec($key, $val, $next_pos);
+      my $new_pos = $db->append_rec($rec);
+      my $old_rec_len = $db->rec_len($key_len, $old_val_len);
+      $db->erase($pos, $old_rec_len);
+    } else {
+      $db->replace_val($key, $val, $pos, $next_pos, $old_val_len);
+    }
   } else {
-    # put it back where it was
-    $db->seek($old_val_pos + 8, SEEK_SET);
-    $db->write($val . ("\0" x ($old_val_len - $val_len)));
-
-    my $val_hash = $db->val_hash($val);
-    $db->seek($old_val_pos, SEEK_SET);
-    $db->write_int($val_hash);
-    $db->write_int($val_len);
-
-    $db->seek($ptr_pos, SEEK_SET);
-    $db->write_int($pos);
-
-    $db->truncate($new_pos);
+    my $rec = $db->pack_rec($key, $val, $next_pos);
+    $db->append_rec($rec);
   }
 
-DONE:
   $db->lock_un;
   $val
 }
@@ -167,9 +142,6 @@ sub CLEAR {
   ( )
 }
 
-# during iteration we preload a hash-bucket at a time and
-# check each key right before returning it.
-
 sub NEXTKEY {
   my $db = shift;
 
@@ -203,10 +175,10 @@ sub TIEHASH {
   $db->reopen;
 
   $db->lock_ex;
-  my $end_pos = $db->seek_end;
+  my $end_pos = $db->seek(0, SEEK_END);
 
   if ($end_pos == 0) {
-    my $hash_size = $db->{hash_size} || $hash_size;
+    my $hash_size = $db->{hash_size} || $ddb::hash_size;
     $db->warn("empty, creating $hash_size hash entries");
     $db->write_int($magic);
     $db->write_int($hash_size);
@@ -251,17 +223,70 @@ sub data_section {
   8 + 4 * $db->{hash_size}
 }
 
+sub rec_len {
+  my ($db, $key_len, $val_len) = @_;
+  17 + $key_len + (-$key_len % 4) + $val_len
+}
+
+sub key_hash {
+  my ($db, $key) = @_;
+  my $hash = 0;
+  $hash ^= $_ for unpack 'N4', Digest::MD5::md5($key);
+  $hash % $db->{hash_size}
+}
+
+sub val_hash {
+  my ($db, $val) = @_;
+  my $hash = 0;
+  $hash ^= $_ for unpack 'N4', Digest::MD5::md5($val);
+  # no modulus
+  unpack 'l', pack 'l', $hash
+}
+
+sub key_hash_pos {
+  my ($db, $hash) = @_;
+  8 + 4 * $hash
+}
+
+sub cur_keys {
+  my $db = shift;
+  @{$db->{cur_keys}}
+}
+
 sub die {
   my ($db, $msg) = @_;
-  $msg ||= $!;
+
+  $msg ||= $! . "\n";
+  unless ($msg =~ /\n$/) {
+    my $pos = $db->tell;
+    $msg .= " at $pos";
+    defined($ptr_pos) and $msg .= " from $ptr_pos";
+    $msg .= "\n";
+  }
+
   $db->{lock_count} > 0 and $db->lock_un;
-  die "$0: $$db{filename}: $msg\n";
+  die "$0: $$db{filename}: $msg";
 }
 
 sub warn {
   my ($db, $msg) = @_;
-  $msg ||= $!;
-  warn "$0: $$db{filename}: $msg\n";
+
+  $msg ||= $! . "\n";
+  unless ($msg =~ /\n$/) {
+    $msg .= "\n";
+  }
+
+  warn "$0: $$db{filename}: $msg";
+}
+
+sub tell {
+  my $db = shift;
+  sysseek $db->{fh}, 0, SEEK_CUR
+}
+
+sub seek {
+  my ($db, $where, $whence) = @_;
+  sysseek $db->{fh}, $where, $whence
 }
 
 sub truncate {
@@ -269,31 +294,12 @@ sub truncate {
   truncate($db->{fh}, $size)
 }
 
-sub tell {
-  my $db = shift;
-  sysseek $db->{fh}, 0, SEEK_CUR or $db->die('tell');
-}
-
-sub seek {
-  my ($db, $where, $whence) = @_;
-  sysseek($db->{fh}, $where, $whence);
-}
-
-sub seek_end {
-  my $db = shift;
-  $db->seek(0, SEEK_END);
-  $db->tell
-}
-
 sub read {
   my ($db, undef, $len) = @_;
   my $check_len = sysread($db->{fh}, $_[1], $len);
   unless ($check_len == $len) {
     my $pos = $db->tell - $check_len;
-    $db->die(
-      "cannot read $len bytes at $pos" .
-      (defined($ptr_pos) ? " from $ptr_pos" : "")
-    );
+    $db->die("cannot read $len bytes");
   }
   $_[0]
 }
@@ -307,10 +313,7 @@ sub read_byte {
 sub read_sentinel {
   my $db = shift;
   my $byte = $db->read_byte;
-  $byte eq $sentinel or $db->die(
-    "bad sentinel $byte at " . ($db->tell - 1) .
-    (defined($ptr_pos) ? " from $ptr_pos" : "")
-  );
+  $byte eq $sentinel or $db->die("bad sentinel $byte");
 }
 
 sub read_int {
@@ -349,51 +352,48 @@ sub read_empty {
 }
 
 sub read_key {
-  my $db = shift;
+  my ($db, $pos, $end_pos) = @_;
 
+  $db->read_sentinel;
+  my $next_pos = $db->read_int;
   my $key_len = $db->read_int;
-  $key_len < 0 and $db->die(
-    "bad key len $key_len at " . ($db->tell - 4) .
-    (defined($ptr_pos) ? " from $ptr_pos" : "")
-  );
+
+  if (@_ > 1) {
+    $key_len < 0 || $pos + $key_len > $end_pos and
+      $db->die("key_len $key_len out of bounds");
+  }
 
   $db->read(my $key, $key_len);
-  $key
+  wantarray ? ($key, $next_pos, $key_len) : $key
 }
 
 sub read_val {
-  my ($db, $key_len) = @_;
+  my ($db, $key_len, $pos, $end_pos) = @_;
 
   $db->align_val($key_len);
   my $val_hash = $db->read_int;
-
   my $val_len = $db->read_int;
-  $val_len < 0 and $db->die(
-    "bad val len $val_len at " . ($db->tell - 4) .
-    (defined($ptr_pos) ? " from $ptr_pos" : "")
-  );
+  my $rec_len = $db->rec_len($key_len, $val_len);
 
-  $db->read(my $val, $val_len);
-
-  if ($debug) {
-    my $check_val_hash = $db->val_hash($val);
-    $check_val_hash == $val_hash or $db->die(
-      "val_hash mismatch" .
-      (defined($ptr_pos) ? ", from $ptr_pos" : "")
-    );
+  if (@_ > 2) {
+    $val_len < 0 || $pos + $rec_len > $end_pos and
+      $db->die("val_len $val_len out of bounds");
   }
 
-  wantarray ? ($val, $val_hash) : $val
+  $db->read(my $val, $val_len);
+  wantarray ? ($val, $val_hash, $rec_len) : $val
+}
+
+sub read_rec {
+  my ($db, $pos, $end_pos) = @_;
+  my ($key, $next_pos, $key_len) = $db->read_key($pos, $end_pos);
+  my ($val, $val_hash, $rec_len) = $db->read_val($key_len, $pos, $end_pos);
+  ($key, $val, $next_pos, $val_hash, $rec_len)
 }
 
 sub align_val {
   my ($db, $key_len) = @_;
   $db->seek((defined($key_len) ? -$key_len : -$db->tell) % 4, SEEK_CUR);
-}
-
-sub rec_len {
-  my ($db, $key_len, $val_len) = @_;
-  17 + $key_len + (-$key_len % 4) + $val_len
 }
 
 sub write {
@@ -403,9 +403,8 @@ sub write {
   my $check_len = syswrite($db->{fh}, $str, $len);
 
   unless ($check_len == $len) {
-    my $pos = $db->tell;
     my $missed = $check_len - $len;
-    $db->die("cannot write $missed/$check_len bytes at $pos, aborting");
+    $db->die("cannot write $missed/$check_len bytes");
   }
 
   $len
@@ -432,7 +431,7 @@ sub write_int {
     );
   }
 
-  $db->write(pack N => $int)
+  $db->write(pack 'N', $int);
 }
 
 sub write_key {
@@ -453,11 +452,11 @@ sub write_zero {
   $db->write("\0" x $len)
 }
 
-sub make_rec {
-  my ($db, $key, $val, $next_pos) = @_;
+sub pack_rec {
+  my ($db, $key, $val, $next_pos, $val_hash) = @_;
 
   my $val_align = "\0" x (-length($key) % 4);
-  my $val_hash = $db->val_hash($val);
+  defined($val_hash) or $val_hash = $db->val_hash($val);
 
   my $rec = join '',
     pack('C', $sentinel),
@@ -477,57 +476,81 @@ sub make_rec {
 }
 
 sub write_rec {
-  my ($db, $rec) = @_;
+  my ($db, $pos, $rec) = @_;
+
+  $db->seek($pos, SEEK_SET);
 
   if ($debug) {
-    my $pos = $db->tell;
-    $pos % 4 == 3 or $db->warn("writing misaligned record at $pos");
+    $db->tell % 4 == 3 or $db->warn("writing misaligned record at $pos");
   }
 
-  $db->write($rec)
+  $db->write($rec);
+  $db->seek($ptr_pos, SEEK_SET);
+  $db->write_int($pos);
 }
 
 sub append_rec {
   my ($db, $rec) = @_;
 
   # prewrite zero for file integrity
-  my $pos = $db->seek_end;
+  my $pos = $db->seek(0, SEEK_END);
   my $align = 3 - $pos % 4;
   $pos += $align;
+  $db->write_zero($align + length($rec));
 
-  my $rec_len = length($rec);
-  $db->write_zero($align + $rec_len);
-
-  $db->seek($pos, SEEK_SET);
-  $db->write_rec($rec);
+  $db->write_rec($pos, $rec);
 
   $pos
 }
 
 sub move_rec {
   my ($db, $rec, $old_pos, $new_pos) = @_;
-
-  # carefully swap using the end of the file as a buffer
-  my $tmp_pos = $db->append_rec($rec);
-  
-  $db->seek($ptr_pos, SEEK_SET);
-  $db->write_int($tmp_pos);
-  
   my $rec_len = length($rec);
-  $db->erase($old_pos, $rec_len);
+
+  # always move backwards
+  if ($old_pos < $new_pos + $rec_len) {
+    # swap using the end of the file as a buffer
+    my $tmp_pos = $db->append_rec($rec);
+    $db->erase($old_pos, $rec_len);
+    $db->write_rec($new_pos, $rec);
+    $db->truncate($tmp_pos);
+  } else {
+    $db->write_rec($new_pos, $rec);
+    $db->erase($old_pos, $rec_len);
+  }
   
-  $db->seek($new_pos, SEEK_SET);
-  $db->write_rec($rec);
-  
-  $db->seek($ptr_pos, SEEK_SET);
-  $db->write_int($new_pos);
-  
-  $db->truncate($tmp_pos);
   $new_pos
+}
+
+sub replace_val {
+  my ($db, $key, $val, $pos, $next_pos, $old_val_len) = @_;
+
+  my $val_len = length($val);
+  my $val_hash = $db->val_hash($val);
+  my $rec = $db->pack_rec($key, $val, $next_pos, $val_hash);
+  my $val_pos = $pos + length($rec) - $val_len - 8;
+
+  my $new_pos = $db->append_rec($rec);
+
+  # put it back where it was
+  $db->seek($val_pos + 8, SEEK_SET);
+  $db->write($val . ("\0" x ($old_val_len - $val_len)));
+
+  $db->seek($val_pos, SEEK_SET);
+  $db->write_int($val_hash);
+  $db->write_int($val_len);
+
+  $db->seek($ptr_pos, SEEK_SET);
+  $db->write_int($pos);
+
+  $db->truncate($new_pos);
+
+  $pos
 }
 
 sub lock_ex {
   my $db = shift;
+  $$ == $db->{pid} or $db->reopen;
 
   if ($db->{lock_count} > 0) {
     # this is allowed by flock but it releases the LOCK_SH
@@ -536,7 +559,11 @@ sub lock_ex {
     # LOCK_UN first if you want the flock behavior.
     $db->{lock_type} == LOCK_EX or $db->die("lock conversion");
   } elsif ($db->{lock_count} == 0) {
-    flock($db->{fh}, LOCK_EX) or $db->die("lock_ex");
+    RETRY: unless (flock($db->{fh}, LOCK_EX)) {
+      $db->warn("flock error, retrying: $!");
+      $db->reopen;
+      goto RETRY;
+    }
   } else {
     $db->die("negative lock count");
   }
@@ -547,9 +574,14 @@ sub lock_ex {
 
 sub lock_sh {
   my $db = shift;
+  $$ == $db->{pid} or $db->reopen;
 
   if ($db->{lock_count} == 0) {
-    flock($db->{fh}, LOCK_SH) or $db->die("lock_sh");
+    RETRY: unless (flock($db->{fh}, LOCK_SH)) {
+      $db->warn("flock error, retrying: $!");
+      $db->reopen;
+      goto RETRY;
+    }
     $db->{lock_type} = LOCK_SH;
   } elsif ($db->{lock_count} < 0) {
     $db->die("negative lock count");
@@ -560,57 +592,39 @@ sub lock_sh {
 
 sub lock_un {
   my $db = shift;
+
   if ($db->{lock_count} < 1) {
     $db->warn("no locks held");
     flock($db->{fh}, LOCK_UN);
     0
   } elsif ($db->{lock_count} == 1) {
     flock($db->{fh}, LOCK_UN);
+    undef $db->{lock_type};
     --$db->{lock_count}
   } else {
     --$db->{lock_count}
   }
 }
 
-sub cur_keys {
-  my $db = shift;
-  @{$db->{cur_keys}}
-}
-
-sub key_hash {
-  my ($db, $key) = @_;
-  my $hash = 0;
-  $hash ^= $_ for unpack 'N4', Digest::MD5::md5($key);
-  $hash % $db->{hash_size}
-}
-
-sub val_hash {
-  my ($db, $val) = @_;
-  my $hash = 0;
-  $hash ^= $_ for unpack 'N4', Digest::MD5::md5($val);
-  # no modulus
-  unpack 'l', pack 'l', $hash
-}
-
-sub key_hash_pos {
-  my ($db, $hash) = @_;
-  8 + 4 * $hash
-}
-
 sub lock   { shift->lock_ex }
 sub unlock { shift->lock_un }
 
-# call this after fork so locks work again
+# we call this after fork so locks work again
 sub reopen {
   my $db = shift;
 
   $db->{fh} and close $db->{fh};
   undef $db->{fh};
-  undef $db->{lock_type};
-  $db->{lock_count} = 0;
+  if ($db->{lock_count} > 0) {
+    $db->warn('reopening with held locks');
+    undef $db->{lock_type};
+    $db->{lock_count} = 0;
+  }
 
   sysopen($db->{fh}, $db->{filename}, O_RDWR | O_CREAT) or $db->die;
   binmode $db->{fh};
+
+  $db->{pid} = $$; # keep track of forks
 
   $db
 }
@@ -626,20 +640,16 @@ sub find {
   my %loop_test; # debug
 
   while ($pos != 0) {
-    $pos % 4 == 3 or
-      $db->die("found misaligned record at $pos from $ptr_pos");
-    $pos < 0 and
-      $db->die("found negative record at $pos from $ptr_pos");
+    $pos % 4 == 3 && $pos >= 0 or
+      $db->die("found misaligned record");
 
     if ($debug) {
       $loop_test{$pos}++ and
-        $db->die("loop record at $pos from $ptr_pos");
+        $db->die("loop record");
     }
 
     $db->seek($pos, SEEK_SET);
-    $db->read_sentinel;
-    my $next_pos = $db->read_int;
-    my $check_key = $db->read_key;
+    my ($check_key, $next_pos) = $db->read_key;
 
     $check_key eq $key and
       return wantarray ? ($pos, $next_pos) : $pos;
@@ -653,11 +663,6 @@ sub find {
 
 sub erase {
   my ($db, $pos, $rec_len) = @_;
-
-  $pos % 4 == 3 or $db->die("erase at $pos, alignment error");
-
-  my $end_pos = $db->seek_end;
-  $pos + $rec_len > $end_pos and $rec_len = $end_pos - $pos;
   $db->seek($pos, SEEK_SET);
   $db->write_zero($rec_len);
   $rec_len
@@ -668,8 +673,8 @@ sub erase_panic {
   my ($db, $pos, $status_cb) = @_;
   $status_cb ||= sub { };
   $db->$status_cb(0);
-  
-  my $end_pos = $db->seek_end;
+
+  my $end_pos = $db->seek(0, SEEK_END);
 
   local $db->{cur_keys} = [ ];
   local $db->{cur_hash} = undef;
@@ -692,18 +697,21 @@ sub erase_panic {
   $rec_len
 }
 
+# during iteration we preload a hash-bucket at a time and
+# check each key right before returning it.
+
 sub next_pos {
   my $db = shift;
 
   $db->{cur_keys} ||= [ ];
   my $cur_keys = $db->{cur_keys};
-  my $end_pos = $db->seek_end;
+  my $end_pos = $db->seek(0, SEEK_END);
 
   while (1) {
     while (defined(my $key = shift @$cur_keys)) {
       my ($pos, $next_pos) = $db->find($key);
       defined($pos) and return ($pos, $key);
-      $db->warn("skipping unlinked record");
+      $debug and $db->warn("skipping unlinked cached record");
     }
 
     $db->{cur_hash} =
@@ -721,35 +729,25 @@ sub next_pos {
     my %loop_test; # debug-only
 
     while ($pos != 0) {
-      $pos % 4 == 3 or $db->die("misaligned record at $pos from $ptr_pos");
-      $pos < 0 and $db->die("negative record at $pos from $ptr_pos");
+      $pos % 4 == 3 && $pos >= 0 or
+        $db->die("misaligned record");
 
       if ($debug) {
         $loop_test{$pos}++ and
-          $db->die("loop found at $pos from $ptr_pos");
+          $db->die("loop found");
       }
 
       $db->seek($pos, SEEK_SET);
-      $db->read_sentinel;
-      my $next_pos = $db->read_int;
-      my $key_len = $db->read_int;
-      $key_len < 0 || $pos + $key_len > $end_pos and
-        $db->die("key_len $key_len out of bounds at $pos");
-      $db->read(my $key, $key_len);
+      my ($key, $next_pos, $key_len) = $db->read_key($pos, $end_pos);
 
       if ($debug) {
-        if ($db->{cur_hash} != $db->key_hash($key)) {
-          $db->die("hash mismatch at $pos from $ptr_pos");
-        }
+        $db->{cur_hash} == $db->key_hash($key) or
+          $db->die("key_hash mismatch");
 
-        $db->align_val;
-        my $val_hash = $db->read_int;
-        my $val_len = $db->read_int;
-        my $val_data_pos = $db->tell;
-
-        $val_len < 0 || $val_data_pos + $val_len > $end_pos and
-          $db->die("val_len $val_len out of bounds at $pos");
-        $db->read(my $val, $val_len);
+        my ($val, $val_hash) = $db->read_val($key_len, $pos, $end_pos);
+        my $check_val_hash = $db->val_hash($val);
+        $check_val_hash == $val_hash or
+          $db->die("val_hash mismatch");
       }
 
       push @$cur_keys, $key;
@@ -759,6 +757,7 @@ sub next_pos {
   }
 }
 
+# scan the data section linearly and remove empty space
 sub defrag {
   my ($db, $status_cb) = @_;
   $status_cb ||= sub { };
@@ -766,7 +765,7 @@ sub defrag {
   local $debug = 1;
 
   $db->lock_ex;
-  my $end_pos = $db->seek_end;
+  my $end_pos = $db->seek(0, SEEK_END);
   $db->$status_cb(0, $end_pos);
   
   my $empty_pos = $db->data_section;
@@ -787,34 +786,9 @@ sub defrag {
     ep_status_cb($db);
     $ptr_pos = "defrag $pos";
 
-    my ($next_pos, $key, $key_len, $val, $val_hash, $val_len, $rec_len);
-
     $db->lock_ex;
-    eval {
-      $db->read_sentinel;
-      $next_pos = $db->read_int;
-      $key_len = $db->read_int;
-      $key_len < 0 || $pos + $key_len > $end_pos and
-        $db->die("key_len $key_len out of range at $pos");
-    };
-    if ($@) {
-      warn($@);
-      $empty_len += $db->erase_panic($pos, \&ep_status_cb);
-      next;
-    }
-
-    eval {
-      $db->read($key, $key_len);
-      $db->align_val($key_len);
-      $val_hash = $db->read_int;
-
-      $val_len = $db->read_int;
-      $rec_len = $db->rec_len($key_len, $val_len);
-
-      $val_len < 0 || $pos + $rec_len > $end_pos and
-        $db->die("val_len $val_len out of range at $pos");
-      
-      $db->read($val, $val_len);
+    my ($key, $val, $next_pos, $val_hash, $rec_len) = eval {
+      $db->read_rec($pos, $end_pos)
     };
     if ($@) {
       warn($@);
@@ -823,17 +797,27 @@ sub defrag {
     }
     $db->lock_un;
 
+    my $check_val_hash = $db->val_hash($val);
+
     my $check_pos = $db->find($key);
     unless ($check_pos == $pos) {
-      if ($db->val_hash($val) == $val_hash) {
+      if ($check_val_hash == $val_hash) {
         # this can delete indexed data in a pathological case
+        # (a corrupted record with valid hash that overlaps indexed
+        # records, very unlikely by accident).  but it's doesn't
+        # have to scan the entire database like erase_panic.
+
         $db->warn("erasing unlinked record at $pos+$rec_len");
         $empty_len += $db->erase($pos, $rec_len);
       } else {
+        $db->warn("val_hash mismatch at $pos+$rec_len");
         $empty_len += $db->erase_panic($pos, \&ep_status_cb);
       }
       next;
     }
+
+    $check_val_hash == $val_hash or
+      $db->die("val_hash mismatch");
 
     if (my $align = 3 - $empty_pos % 4) {
       $empty_pos += $align;
@@ -845,20 +829,8 @@ sub defrag {
       next;
     }
 
-    my $rec = $db->make_rec($key, $val, $next_pos);
-
-    if ($empty_len < $rec_len) {
-      $db->move_rec($rec, $pos, $empty_pos);
-    } else {
-      $db->seek($empty_pos, SEEK_SET);
-      $db->write_rec($rec);
-  
-      $db->seek($ptr_pos, SEEK_SET);
-      $db->write_int($empty_pos);
-  
-      $db->erase($pos, $rec_len);
-    }
-
+    my $rec = $db->pack_rec($key, $val, $next_pos, $val_hash);
+    $db->move_rec($rec, $pos, $empty_pos);
     $empty_pos += $rec_len;
   }
   
@@ -911,7 +883,7 @@ sub test {
   local *db = \%$db_hash;
   tied(%db) == $db or $db->die('tied hash does not match object');
 
-  $ok_cb ||= sub { $_[2] or $_[0]->die("not ok $_[1]") };
+  $ok_cb ||= sub { $_[2] or $_[0]->die("not ok $_[1]\n") };
   sub ok { $db->$ok_cb(@_) }
 
   local $SIG{PIPE} = sub { };
@@ -923,7 +895,7 @@ sub test {
   %db = ( );
   ok 0, keys(%db) == 0;
 
-  # store, delete
+  # store, fetch, delete, exists
   $db{hello} = 'world';
   ok 1, $db{hello} eq 'world';
   ok 2, 'world' eq delete $db{hello};
@@ -940,7 +912,7 @@ sub test {
   # parallel inserts
   for my $key (1 .. 100) {
     wait, --$procs until $procs < $max_procs;
-    ++$procs; fork and next; $db->reopen;
+    ++$procs; fork and next;
     $db{$key} = $key; 
     exit 0;
   }
@@ -957,7 +929,7 @@ sub test {
   # swap a bunch of values with recursive locks in parallel
   for (1 .. 99) {
     wait, --$procs until $procs < $max_procs;
-    ++$procs; fork and next; $db->reopen;
+    ++$procs; fork and next;
     my $key1 = 1 + int rand 100;
     my $key2 = 1 + int rand 100;
     $db->lock_ex;
@@ -990,7 +962,7 @@ sub test {
   # growing values in parallel
   while (my ($k, $v) = each %db) {
     wait, --$procs until $procs < $max_procs;
-    ++$procs; fork and next; $db->reopen;
+    ++$procs; fork and next;
     $db{$k} = $v . $v;
     exit 0;
   }
@@ -1001,19 +973,19 @@ sub test {
   ok 20, exists $db{51};
 
   # defrag should shrink after value growth
-  my $end0 = $db->seek_end;
+  my $end0 = $db->seek(0, SEEK_END);
   $db->defrag;
-  my $end1 = $db->seek_end;
+  my $end1 = $db->seek(0, SEEK_END);
   ok 21, $end1 < $end0;
 
   # but not again
   $db->defrag;
-  my $end2 = $db->seek_end;
+  my $end2 = $db->seek(0, SEEK_END);
   ok 22, $end1 == $end2;
 
   # clear should truncate
   %db = ('a' .. 'z');
-  my $end3 = $db->seek_end;
+  my $end3 = $db->seek(0, SEEK_END);
   ok 23, $end3 < $end2;
   ok 24, values(%db) == 13;
 
@@ -1029,9 +1001,9 @@ sub test {
   $db->write(pack('C', $sentinel) . "\x02\x03\x04\x05");
 
   # defrag should erase the noise and warn
-  $db->warn("warning expected on test 26");
+  $db->warn("warnings expected on test 26");
   $db->defrag;
-  my $end4 = $db->seek_end;
+  my $end4 = $db->seek(0, SEEK_END);
   my $check_end4 = $db->data_section;
   $check_end4 += 3 - $check_end4 % 4;
   $check_end4 += $db->rec_len(1, 5);
@@ -1041,25 +1013,26 @@ sub test {
   $db{pack 'C', $_} = $_ for 0 .. 255;
   ok 28, $db{a} == ord 'a';
 
-  # skeet-shooting integrity test
+  # skeet-shooting test
   $db->warn("warnings permitted on test 29");
-  for my $wait (1 .. 10) {
-    my @pid;
-    $db->lock_sh;
-    for (1 .. $max_procs) {
-      if (my $pid = fork) {
-        ++$procs;
-        push @pid, $pid;
-        next;
-      }
-      $db->reopen;
-      ++$db{pack 'C', int rand 256};
-      exit 0;
+  my @pid;
+
+  $SIG{ALRM} = sub { };
+  for (1 .. $max_procs) {
+    if (my $pid = fork) {
+      ++$procs;
+      push @pid, $pid;
+      next;
     }
-    $db->lock_un;
-    select(undef, undef, undef, $wait / 100);
-    kill 9 => $_ for @pid;
-    --$procs until wait < 0;
+    $db{pack 'C', int rand 256} = 'x';
+    exit 0;
+  }
+  undef $SIG{ALRM};
+
+  while ($procs > 0)  {
+    kill ALRM => $_ for @pid;
+    select undef, undef, undef, 0.1;
+    --$procs while waitpid(-1, &WNOHANG) > 0;
   }
 
   $db->defrag;
@@ -1084,7 +1057,7 @@ sub test {
   ok 32, keys(%db) == 0;
 
   $db->defrag;
-  my $size = $db->seek_end;
+  my $size = $db->seek(0, SEEK_END);
   ok 33, $size == $db->data_section;
 
   for (1 .. 100) {
@@ -1128,7 +1101,7 @@ sub test {
   $db->defrag;
   ok 42, keys(%db) == $keys;
 
-  my $end_pos = $db->seek_end;
+  my $end_pos = $db->seek(0, SEEK_END);
   my $key = 'hello';
   $db{$key} = 'world';
   my $keys = keys(%db);
@@ -1154,7 +1127,7 @@ sub test {
   my $keys = keys(%db);
   $db->defrag;
   ok 47, keys(%db) == $keys;
-  ok 48, $db->seek_end == $end_pos;
+  ok 48, $db->seek(0, SEEK_END) == $end_pos;
 
   $db->lock_sh;
   my ($k_pos, $k) = $db->next_pos;
@@ -1220,18 +1193,21 @@ sub test {
   $db->warn('warnings expected on test 63');
   $db->seek(8, SEEK_SET);
   $db->write_int(int rand(1 << 16)) for 1 .. 3000;
+
   $db->seek($db->key_hash_pos($db->key_hash('hello')), SEEK_SET);
+  $db->write_int(0);
+  $db{hello} = 'world';
+
   $db->repair;
-  delete $db{$_} for keys %db;
   $db->defrag;
-  ok 63, keys(%db) == 0;
+  ok 63, $db{hello} eq 'world';
 
   # no warnings or truncation
-  my $size = $db->seek_end;
+  my $size = $db->seek(0, SEEK_END);
   $db->repair;
   $db->defrag;
-  ok 64, $db->seek_end == $size;
-  ok 65, keys(%db) == 0;
+  ok 64, $db->seek(0, SEEK_END) == $size;
+  ok 65, keys(%db) == 1;
 
   1
 }

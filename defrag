@@ -20,12 +20,8 @@ sub status {
   }
 }
 
-eval {
-  $db->defrag(\&status);
-};
-
-print STDERR "\n";
-$@ and die $@;
+$db->defrag(\&status);
 
 untie %db;
+print STDERR "\n";
 exit 0;

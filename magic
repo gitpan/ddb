@@ -1,2 +1,4 @@
 0	belong	0xDDB10000	ddb hash file, version 1,
 >4	belong	x		size %d
+0	belong	0xDDB10100	ddb hash file, version 1.01,
+>4	belong	x		size %d

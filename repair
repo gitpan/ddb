@@ -18,6 +18,5 @@ sub status {
 $db->repair(\&status);
 
 untie %db;
-
 print STDERR "\n";
 exit 0;
