@@ -6,6 +6,11 @@ use POSIX qw(:sys_wait_h);
 use Fcntl qw(:seek :flock O_RDONLY O_RDWR O_TRUNC O_CREAT);
 use Digest::MD5;
 
+BEGIN {
+  eval { require File::Sync; };
+  $@ and *File::Sync::fsync = sub { 1 };
+}
+
 # usage
 #
 # use ddb;
@@ -19,13 +24,14 @@ use Digest::MD5;
 # untie %db;
 
 # globals
-$version	= 1.1;
+$version	= 1.2;
 $hash_size	= 16381; # default, or pass to tie after filename
 $sentinel	= 1;
 $empty_buf_size	= 256;
 $magic		= 0xDDB10000;
 $debug		= 0;
 $max_procs	= 10; # for test
+$show_step	= 100;
 $ptr_pos	= undef;
 
 # file format
@@ -75,6 +81,12 @@ DONE:
 sub STORE {
   my ($db, $key, $val) = @_;
 
+  unless (defined $val) {
+    # how else to make it undef?
+    $db->DELETE($key);
+    return undef;
+  }
+
   $db->lock_ex;
   my ($pos, $next_pos) = $db->find($key);
 
@@ -98,6 +110,7 @@ sub STORE {
     $db->append_rec($rec);
   }
 
+  $db->sync;
   $db->lock_un;
   $val
 }
@@ -121,6 +134,7 @@ sub DELETE {
   $db->erase($pos, $rec_len);
 
 DONE:
+  $db->sync;
   $db->lock_un;
   $val
 }
@@ -138,6 +152,7 @@ sub CLEAR {
   $pos == $db->data_section or die;
   $db->truncate($pos);
 
+  $db->sync;
   $db->lock_un;
   ( )
 }
@@ -156,6 +171,7 @@ sub FIRSTKEY {
   my $db = shift;
   undef $db->{cur_hash};
   @{$db->{cur_keys}} = ( );
+  $$db{rec_count} = 0;
   $db->NEXTKEY
 }
 
@@ -168,6 +184,7 @@ sub TIEHASH {
     hash_size	=> $hash_size,
     cur_hash	=> undef,
     cur_keys	=> [ ],
+    rec_count	=> 0,
     lock_count	=> 0,
     lock_type	=> undef,
   }, $p;
@@ -198,6 +215,7 @@ sub TIEHASH {
   my $min_size = $db->data_section;
   $end_pos < $min_size and
     $db->die("file truncated, $end_pos / $min_size expected bytes");
+  $db->sync;
   $db->lock_un;
 
   $db
@@ -209,6 +227,7 @@ sub UNTIE {
   $db->{lock_count} = 0;
   $db->{lock_type} = undef;
   @{$db->{cur_keys}} = ( );
+  $db->{rec_count} = 0;
   $db->{cur_hash} = undef;
 
   close $db->{fh};
@@ -277,6 +296,25 @@ sub warn {
   }
 
   warn "$0: $$db{filename}: $msg";
+}
+
+sub show_status {
+  my $db = shift;
+
+  defined($$db{cur_hash}) or return;
+  my $last_complete = int(100 * ($$db{cur_hash} - 1) / $$db{hash_size});
+  my $complete = int(100 * $$db{cur_hash} / $$db{hash_size});
+  $last_complete == $complete && $$db{rec_count} % $show_step and return;
+  my $nl = ($complete == 100) ? "  \r\n" : "  \r";
+  print STDERR "$0: $$db{rec_count} records, $complete% complete  $nl";
+}
+
+
+# file operations
+
+sub sync {
+  my $db = shift;
+  File::Sync::fsync($db->{fh}) or $db->warn('fsync failed');
 }
 
 sub tell {
@@ -678,6 +716,7 @@ sub erase_panic {
 
   local $db->{cur_keys} = [ ];
   local $db->{cur_hash} = undef;
+  local $db->{rec_count} = 0;
   my $count = 0;
   
   while (1) {
@@ -701,7 +740,8 @@ sub erase_panic {
 # check each key right before returning it.
 
 sub next_pos {
-  my $db = shift;
+  my ($db, $status_cb) = @_;
+  $status_cb ||= sub { };
 
   $db->{cur_keys} ||= [ ];
   my $cur_keys = $db->{cur_keys};
@@ -710,13 +750,17 @@ sub next_pos {
   while (1) {
     while (defined(my $key = shift @$cur_keys)) {
       my ($pos, $next_pos) = $db->find($key);
-      defined($pos) and return ($pos, $key);
+      if (defined($pos)) {
+        ++$db->{rec_count};
+        return ($pos, $key);
+      }
       $debug and $db->warn("skipping unlinked cached record");
     }
 
     $db->{cur_hash} =
       defined($db->{cur_hash}) ?
       $db->{cur_hash} + 1 : 0;
+    $db->$status_cb;
     unless ($db->{cur_hash} < $db->{hash_size}) {
       undef $db->{cur_hash};
       return ( );
@@ -802,13 +846,27 @@ sub defrag {
     my $check_pos = $db->find($key);
     unless ($check_pos == $pos) {
       if ($check_val_hash == $val_hash) {
-        # this can delete indexed data in a pathological case
-        # (a corrupted record with valid hash that overlaps indexed
-        # records, very unlikely by accident).  but it's doesn't
-        # have to scan the entire database like erase_panic.
+        if (defined($check_pos)) {
+          # this can delete indexed data in a pathological case
+          # (a corrupted record with valid hash that overlaps indexed
+          # records, very unlikely by accident).  but it's doesn't
+          # have to scan the entire database like erase_panic.
+        
+          $db->warn("erasing unlinked record at $pos+$rec_len");
+          $empty_len += $db->erase($pos, $rec_len);
+        } else {
+          # this record is left over from an aborted delete or
+          # part of a chain after an erased corrupted record,
+          # so we relink it.
 
-        $db->warn("erasing unlinked record at $pos+$rec_len");
-        $empty_len += $db->erase($pos, $rec_len);
+          $db->warn("relinking unlinked record at $pos+$rec_len");
+
+          $db->seek($pos + 1, SEEK_SET);
+          $db->write_int(0);
+
+          $db->seek($ptr_pos, SEEK_SET);
+          $db->write_int($pos);
+        }
       } else {
         $db->warn("val_hash mismatch at $pos+$rec_len");
         $empty_len += $db->erase_panic($pos, \&ep_status_cb);
@@ -819,21 +877,21 @@ sub defrag {
     $check_val_hash == $val_hash or
       $db->die("val_hash mismatch");
 
-    if (my $align = 3 - $empty_pos % 4) {
-      $empty_pos += $align;
-      $empty_len -= $align;
+    my $align = 3 - $empty_pos % 4;
+    $empty_pos += $align;
+    $empty_len -= $align;
+
+    if ($empty_len > 0) {
+      my $rec = $db->pack_rec($key, $val, $next_pos, $val_hash);
+      $db->move_rec($rec, $pos, $empty_pos);
+    } else {
+      $empty_len = 0;
     }
 
-    unless ($empty_len > 0) {
-      $empty_pos += $rec_len;
-      next;
-    }
-
-    my $rec = $db->pack_rec($key, $val, $next_pos, $val_hash);
-    $db->move_rec($rec, $pos, $empty_pos);
     $empty_pos += $rec_len;
   }
   
+  $db->sync;
   $db->$status_cb($end_pos, $end_pos);
   $db->lock_un;
 }
@@ -842,36 +900,48 @@ sub defrag {
 sub repair {
   my ($db, $status_cb) = @_;
   $status_cb ||= sub { };
-  $db->$status_cb(my $count = 0);
 
   local $debug = 1;
   local $db->{cur_keys} = [ ];
   local $db->{cur_hash} = undef;
+  local $db->{rec_count} = 0;
 
   $db->lock_ex;
 
   while (1) {
     $db->lock_sh;
-    my $pos = eval { $db->next_pos };
+    my $pos = eval { $db->next_pos($status_cb) };
 
     unless ($@) {
       $db->lock_un;
       defined($pos) or last;
-      $db->$status_cb(++$count);
+      $db->$status_cb;
       next;
     }
     warn $@;
 
     unless ($ptr_pos > 0) {
-      $db->warn("bad ptr $ptr_ps, cannot repair bucket $$db{cur_hash}");
+      $db->warn("bad ptr $ptr_pos, cannot repair bucket $$db{cur_hash}");
       next;
     }
 
-    $db->warn("unlinking from $ptr_pos, bucket $$db{cur_hash}");
     $db->seek($ptr_pos, SEEK_SET);
-    $db->write_int(0);
+    my $pos = $db->read_int;
+
+    $db->seek($pos, SEEK_SET);
+
+    $db->lock_sh;
+    my ($key, $next_pos) = eval { $db->read_key };
+    $@ or $db->lock_un;
+    $next_pos ||= 0;
+    $next_pos == $ptr_pos - 1 and $next_pos = 0;
+
+    $db->warn("unlinking from $ptr_pos, to $next_pos");
+    $db->seek($ptr_pos, SEEK_SET);
+    $db->write_int($next_pos);
   }
 
+  $db->sync;
   $db->lock_un;
 }
 
@@ -930,8 +1000,8 @@ sub test {
   for (1 .. 99) {
     wait, --$procs until $procs < $max_procs;
     ++$procs; fork and next;
-    my $key1 = 1 + int rand 100;
-    my $key2 = 1 + int rand 100;
+    my $key1 = 1 + int rand 49;
+    my $key2 = 51 + int rand 49;
     $db->lock_ex;
     @db{$key1, $key2} = @db{$key2, $key1};
     $db->lock_un;
@@ -1086,14 +1156,13 @@ sub test {
 
   $db->warn("warnings expected on test 38");
   $db->repair;
-  my $keys = keys(%db);
-  ok 38, $keys < 100;
+  ok 38, keys(%db) <= 98;
   ok 39, !exists $db{101}; 
   ok 40, !exists $db{99}; 
 
   $db->warn("warnings expected on test 41");
   $db->defrag;
-  ok 41, keys(%db) <= $keys;
+  ok 41, keys(%db) == 100;
 
   # no warnings
   my $keys = keys(%db);
@@ -1186,8 +1255,8 @@ sub test {
 
   ok 59, exists $db{$k1};
   ok 60, exists $db{$k2};
-  ok 61, !exists $db{$k3};
-  ok 62, keys(%db) < $keys;
+  ok 61, exists $db{$k3};
+  ok 62, keys(%db) == $keys;
 
   # ultimate test
   $db->warn('warnings expected on test 63');

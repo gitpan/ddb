@@ -7,35 +7,106 @@ use Fcntl qw(:seek);
 $show_step	= 100;
 $col_delim	= "\t";
 $row_delim	= "\n";
+$key_type	= 'a*';
+$val_type	= 'a*';
+$show_key	= 1;
+$show_val	= 1;
+$show_status	= \&ddb::show_status;
 
-if (@ARGV < 1) {
-  print STDERR "Usage: $0 file.ddb\n";
+sub usage {
+  print STDERR join '',
+    "Usage:\n",
+    "	$0 [options ...] file.ddb\n",
+    "Options:\n",
+    "	[-k[:type]]            # default type $key_type\n",
+    "	[-v[:type]]            # default type $val_type\n",
+    "	[-t col_delim]         # default \\t\n",
+    "	[-n row_delim]         # default \\n\n",
+    "	[-s show_step]         # default 100\n",
+    "	[-q]                   # quiet\n",
+    ;
   exit 1;
 }
 
-my $db_filename = shift(@ARGV);
-my $db = tie %db, ddb, $db_filename or die "$0: $db_filename: $!\n";
+@ARGV or usage;
+my $db_filename = pop(@ARGV);
+-e "$db_filename.meta" and do "$db_filename.meta";
 
-my $count = 0;
+while ($ARGV[0] =~ /^-(.*$)/) {
+  my $opt = $1;
+  shift(@ARGV);
+
+  $opt eq '-' and last;
+
+  if ($opt =~ /^k/) {
+    $opt =~ /^k:(.+$)/ and $key_type = $1;
+    $show_val = 0;
+    next;
+  }
+
+  if ($opt =~ /^v/) {
+    $opt =~ /^v:(.+$)/ and $val_type = $1;
+    $show_key = 0;
+    next;
+  }
+
+  if ($opt =~ /^t(.*$)/) {
+    $col_delim = $1 || shift(@ARGV) or usage;
+    $col_delim = qr/$col_delim/;
+    next;
+  }
+
+  if ($opt =~ /^n(.*$)/) {
+    $row_delim = $1 || shift(@ARGV) or usage;
+    next;
+  }
+
+  if ($opt =~ /^s(.*$)/) {
+    $show_step = $1 || shift(@ARGV) or usage;
+    next;
+  }
+
+  if ($opt =~ /^c(.*$)/) {
+    $hash_size = $1 || shift(@ARGV) or usage;
+    next;
+  }
+
+  if ($opt eq 'q') {
+    $show_status = sub { };
+    next;
+  }
+
+  usage;
+}
+
+@ARGV and usage;
+
+$show_key || $show_val or $show_key = $show_val = 1;
+-e $db_filename or die "$0: $db_filename: No such file or directory\n";
+my $db = tie %db, ddb, $db_filename, $hash_size or die "$0: $db_filename: $!\n";
 
 select(STDOUT);
 $| = 1;
 
 eval {
   while (1) {
-    my ($k, $v) = each %db;
+    $db->lock_ex;
+    my (undef, $k) = $db->next_pos($show_status);
+    $show_val && defined $k and my $v = $db{$k};
+    $db->lock_un;
+
     last unless defined $k;
 
-    $count % $show_step or print STDERR "$0: $count records\r";
-    ++$count;
-    print join('', $k, $col_delim, $v, $row_delim);
+    my $line;
+    $show_key and $line .= join($col_delim, unpack $key_type, $k);
+    $show_key && $show_val and $line .= $col_delim;
+    $show_val and $line .= join($col_delim, unpack $val_type, $v);
+    $line .= $row_delim;
+
+    print $line;
   }
 };
 
-print STDERR "$0: $count records\r";
-print STDERR "\n";
-
-$@ and die $@;
-
 untie %db;
+$@ and die $@;
 exit 0;
